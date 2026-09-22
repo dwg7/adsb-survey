@@ -1,0 +1,7 @@
+# Data stays local: adsb.lol archives (ODbL), adsb.fi samples (personal,
+# non-commercial use only), and everything derived from them.
+data/
+.DS_Store
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
