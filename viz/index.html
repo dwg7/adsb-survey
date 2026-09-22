@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>adsb-survey — world tile density</title>
+    <link rel="stylesheet" href="https://unpkg.com/openmct@4.3.1/dist/espressoTheme.css" />
+    <!-- MapLibre pinned to v5, not v6: v6 dropped the plain-<script>/window.maplibregl
+         UMD bundle for ES modules only (dwg7/cafebabe patterns/maplibre-gl-js-*.md,
+         confirmed in dwg7/sas0's docs/index.html). -->
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <script>
+      // Open MCT's built-in search indexer starts a SharedWorker from its own
+      // (CDN) origin; loading it here would be cross-origin and browsers block
+      // it. Falls back to the synchronous in-page search instead.
+      // (Same fix as dwg7/sas0's docs/index.html.)
+      window.SharedWorker = undefined;
+    </script>
+    <script src="https://unpkg.com/openmct@4.3.1/dist/openmct.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+    <div id="app"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

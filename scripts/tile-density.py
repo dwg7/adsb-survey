@@ -1,37 +1,51 @@
 #!/usr/bin/env python3
 """Tile density: how many aircraft/positions a day's adsb.lol archive has per
-long-list tile (CLAUDE.md 3節), as one input to narrowing the six candidates.
+zoom-4 (z/x/y) tile, worldwide -- an input to narrowing CLAUDE.md 3節's long list.
 
 Walks traces/ under an extracted globe_history day (traces/<subdir>/trace_full_<icao>.json[.gz],
 per wiedehopf/readsb's globe_history "trace jsons" format: trace points are arrays
 [seconds_since_file_timestamp, lat, lon, alt, gs, track, flags, vrate, ...]).
-Counts, per tile: aircraft with >=1 position inside, total position points inside,
-and a coarse-grid empty-cell fraction as a rough proxy for coverage gaps.
 
-Not yet verified against real adsb.lol files (written while the first day's archive
-was still downloading) -- run --sample first and sanity-check before trusting the
-full-day numbers. Record any format surprises in DECISIONS.md, not here.
+Reading+decompressing ~83k trace files dominates the cost; bucketing each point into
+its z4 tile (standard XYZ/Web Mercator, verified against CLAUDE.md's six known tile
+bounds) is essentially free in the same pass. So this reports on *all* tiles that saw
+traffic, not just a preselected six -- dropping a candidate tile doesn't save any real
+computation, and the global picture is more useful for narrowing than a fixed list.
 
     python3 scripts/tile-density.py data/extracted/2026.09.18
     python3 scripts/tile-density.py data/extracted/2026.09.18 --sample 200
+    python3 scripts/tile-density.py data/extracted/2026.09.18 --top 40
 """
 import argparse
 import gzip
 import json
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-# tile -> (lon_min, lon_max, lat_min, lat_max), from README.md / CLAUDE.md 3節
-TILES = {
-    "4/14/5": (135.0, 157.5, 41.0, 55.8),   # Hokkaido, Sakhalin, Kurils
-    "4/14/6": (135.0, 157.5, 21.9, 41.0),   # eastern Honshu, Tokyo area
-    "4/13/6": (112.5, 135.0, 21.9, 41.0),   # Korea, eastern China, Taiwan, Kyushu
-    "4/9/4": (22.5, 45.0, 55.8, 66.5),      # southern Finland, Baltic states
-    "4/9/6": (22.5, 45.0, 21.9, 41.0),      # Greece, Turkey, Cyprus, Levant, Egypt
-    "4/7/7": (-22.5, 0.0, 0.0, 21.9),       # West African coast incl. Sierra Leone
+ZOOM = 4
+N = 2 ** ZOOM
+GRID_N = 16  # sub-tile grid per side, for the within-tile empty-cell gap proxy
+
+# long-list tiles from README.md / CLAUDE.md 3節, for labeling only -- (x, y) at z=4
+LONGLIST = {
+    (14, 5): "Hokkaido, Sakhalin, Kurils",
+    (14, 6): "eastern Honshu, Tokyo area",
+    (13, 6): "Korea, eastern China, Taiwan, Kyushu",
+    (9, 4): "southern Finland, Baltic states",
+    (9, 6): "Greece, Turkey, Cyprus, Levant, Egypt",
+    (7, 7): "West African coast incl. Sierra Leone",
 }
-GRID_N = 16  # coarse grid per tile side, for the empty-cell gap proxy
+
+# regions of interest, tracked regardless of density-ranking position (DECISIONS.md D4:
+# thinness itself can be the point -- density is a precondition to interpret results by,
+# not a filter for whether to look) -- (x, y) at z=4, from a representative interior point
+WATCHLIST = {
+    (14, 8): "Papua New Guinea",
+    (8, 7): "Togo",
+    (12, 7): "Laos",
+}
 
 
 def read_json(path: Path):
@@ -45,12 +59,18 @@ def iter_trace_files(traces_dir: Path):
     yield from traces_dir.rglob("trace_full_*.json*")
 
 
-def tile_for_point(lat, lon):
-    hits = []
-    for tile, (lon_min, lon_max, lat_min, lat_max) in TILES.items():
-        if lon_min <= lon < lon_max and lat_min <= lat < lat_max:
-            hits.append(tile)
-    return hits
+def tile_and_frac(lat, lon):
+    """z4 tile (x, y) for (lat, lon), plus fractional position within that tile
+    (0..1 each axis), via the standard XYZ/Web Mercator slippy-map formula.
+    Matches CLAUDE.md's six known tile bounds exactly (checked by hand for 4/14/6)."""
+    lat = max(-85.0511, min(85.0511, lat))  # avoid the mercator pole singularity
+    fx = (lon + 180.0) / 360.0 * N
+    lat_rad = math.radians(lat)
+    fy = (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * N
+    x, y = int(fx), int(fy)
+    x = max(0, min(N - 1, x))
+    y = max(0, min(N - 1, y))
+    return x, y, fx - x, fy - y
 
 
 def main():
@@ -58,15 +78,19 @@ def main():
     ap.add_argument("extracted_dir", type=Path, help="e.g. data/extracted/2026.09.18")
     ap.add_argument("--sample", type=int, default=None,
                      help="only read the first N trace files (quick sanity check)")
+    ap.add_argument("--top", type=int, default=25, help="how many top tiles to print")
+    ap.add_argument("--json-out", type=Path, default=None,
+                     help="write full per-tile stats (all non-empty z4 tiles) as JSON, "
+                          "for the Open MCT/MapLibre viz")
     args = ap.parse_args()
 
     traces_dir = args.extracted_dir / "traces"
     if not traces_dir.is_dir():
         sys.exit(f"no traces/ under {args.extracted_dir}")
 
-    aircraft = defaultdict(set)          # tile -> set of icao
-    points = defaultdict(int)            # tile -> point count
-    cells = defaultdict(set)             # tile -> set of (gx, gy) occupied
+    aircraft = defaultdict(set)   # (x,y) -> set of icao
+    points = defaultdict(int)     # (x,y) -> point count
+    cells = defaultdict(set)      # (x,y) -> set of occupied (gx, gy) sub-cells
     files_seen = 0
     files_bad = 0
 
@@ -86,24 +110,68 @@ def main():
             lat, lon = p[1], p[2]
             if lat is None or lon is None:
                 continue
-            for tile in tile_for_point(lat, lon):
-                lon_min, lon_max, lat_min, lat_max = TILES[tile]
-                aircraft[tile].add(icao)
-                points[tile] += 1
-                gx = int((lon - lon_min) / (lon_max - lon_min) * GRID_N)
-                gy = int((lat - lat_min) / (lat_max - lat_min) * GRID_N)
-                cells[tile].add((min(gx, GRID_N - 1), min(gy, GRID_N - 1)))
+            x, y, frx, fry = tile_and_frac(lat, lon)
+            key = (x, y)
+            aircraft[key].add(icao)
+            points[key] += 1
+            gx, gy = min(int(frx * GRID_N), GRID_N - 1), min(int(fry * GRID_N), GRID_N - 1)
+            cells[key].add((gx, gy))
 
     print(f"trace files read: {files_seen} (unreadable: {files_bad})")
-    print()
-    print("| tile | aircraft | points | grid occupied | empty% |")
-    print("|---|---|---|---|---|")
     total_cells = GRID_N * GRID_N
-    for tile in TILES:
-        occ = len(cells[tile])
+
+    ranked = sorted(aircraft, key=lambda k: -len(aircraft[k]))
+    print()
+    print(f"## top {args.top} tiles worldwide by aircraft count")
+    print()
+    print("| tile | aircraft | points | empty% | note |")
+    print("|---|---|---|---|---|")
+    for key in ranked[:args.top]:
+        x, y = key
+        occ = len(cells[key])
         empty_pct = (1 - occ / total_cells) * 100
-        print(f"| {tile} | {len(aircraft[tile])} | {points[tile]} | "
-              f"{occ}/{total_cells} | {empty_pct:.0f}% |")
+        note = LONGLIST.get(key, "")
+        print(f"| 4/{x}/{y} | {len(aircraft[key])} | {points[key]} | {empty_pct:.0f}% | {note} |")
+
+    def print_table(title, tiles):
+        print()
+        print(f"## {title}")
+        print()
+        print("| tile | aircraft | points | empty% | note |")
+        print("|---|---|---|---|---|")
+        for key, note in tiles.items():
+            x, y = key
+            occ = len(cells[key])
+            empty_pct = (1 - occ / total_cells) * 100
+            print(f"| 4/{x}/{y} | {len(aircraft[key])} | {points[key]} | {empty_pct:.0f}% | {note} |")
+
+    print_table("long-list tiles (CLAUDE.md 3節), for reference", LONGLIST)
+    print_table("watchlist (regions of interest, tracked regardless of rank -- DECISIONS.md D4)",
+                 WATCHLIST)
+
+    if args.json_out:
+        tiles_out = {}
+        for key in aircraft:
+            x, y = key
+            occ = len(cells[key])
+            tiles_out[f"{x},{y}"] = {
+                "x": x, "y": y,
+                "aircraft": len(aircraft[key]),
+                "points": points[key],
+                "empty_pct": round((1 - occ / total_cells) * 100, 1),
+                "longlist": LONGLIST.get(key),
+                "watchlist": WATCHLIST.get(key),
+            }
+        doc = {
+            "date": args.extracted_dir.name,
+            "zoom": ZOOM,
+            "grid_n": GRID_N,
+            "files_read": files_seen,
+            "tiles": tiles_out,
+        }
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(doc, ensure_ascii=False, indent=1))
+        print(f"\nwrote {len(tiles_out)} tiles to {args.json_out}", file=sys.stderr)
 
 
 if __name__ == "__main__":
